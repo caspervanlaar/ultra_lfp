@@ -4,8 +4,6 @@ import gc
 import json
 import math
 import numpy as np
-import scipy.linalg
-from tqdm.auto import tqdm
 from sklearn.model_selection import train_test_split
 from datetime import datetime
 import tensorflow as tf
@@ -52,9 +50,9 @@ except IndexError:
 # Derived Constants
 HIDDEN = 32
 EPOCHS = 10
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 DATA_PERCENT = 0.1
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-3
 REST_BASELINE = 1.0
 H_SCALE = [H_INERTIA, 1.0 - H_INERTIA]
 
@@ -66,10 +64,10 @@ def get_pmnist_data():
     x_test = x_test.reshape(-1, 784).astype('float32') / 255.0
 
     # Fixed Permutation
-    rng = np.random.RandomState(42)
-    perm = rng.permutation(784)
-    x_all = x_all[:, perm]
-    x_test = x_test[:, perm]
+    #rng = np.random.RandomState(42)
+    #perm = rng.permutation(784)
+    #x_all = x_all[:, perm]
+    #x_test = x_test[:, perm]
 
     # Train/Val Split (90/10)
     x_train, x_val, y_train, y_val = train_test_split(
@@ -92,7 +90,7 @@ def get_pmnist_data():
         .batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
     # We need a single batch representation for the metric extractions
-    val_subset_x, val_subset_y = next(iter(val_ds.unbatch().batch(1000)))
+    val_subset_x, val_subset_y = next(iter(val_ds.unbatch().batch(256)))
 
     return train_ds, val_ds, val_subset_x, val_subset_y
 
@@ -174,85 +172,93 @@ def train_step(x, y):
     train_acc_metric.update_state(y, logits)
     return loss
 
-def calculate_complex_metrics(x_val, y_val):
+@tf.function(jit_compile=True)
+def calculate_metrics_gpu(x_val, y_val):
     logits_v, h_seq_v = model(x_val, training=False)
-    h_final = h_seq_v.numpy()[:, -1, :] 
-    
-    # 1. Effective Rank
-    s = scipy.linalg.svdvals(h_final) + 1e-12
-    p_rank = s / (np.sum(s) + 1e-10)
-    eff_rank = np.exp(-np.sum(p_rank * np.log(p_rank + 1e-10)))
+    h_final = h_seq_v[:, -1, :]
+    batch_f = tf.cast(tf.shape(h_final)[0], tf.float32)
 
-    # 2. Entropy
-    counts, _ = np.histogram(h_final, bins=50)
-    p_ent = counts / (h_final.size + 1e-10) 
-    entropy_val = -np.sum(p_ent * np.log2(p_ent + 1e-10))
+    # 1. Effective Rank - GPU SVD
+    s = tf.linalg.svd(h_final, compute_uv=False) + 1e-12
+    p_rank = s / (tf.reduce_sum(s) + 1e-10)
+    eff_rank = tf.exp(-tf.reduce_sum(p_rank * tf.math.log(p_rank + 1e-10)))
 
-    # 3. Synchrony
-    sync_val = (np.sum(np.abs(np.corrcoef(h_final.T + 1e-8))) - HIDDEN) / (HIDDEN**2 - HIDDEN)
+    # 2. Synchrony
+    h_centered = h_final - tf.reduce_mean(h_final, axis=0)
+    h_std = tf.math.reduce_std(h_final, axis=0) + 1e-8
+    h_norm = h_centered / h_std
+    corr_mat = tf.matmul(h_norm, h_norm, transpose_a=True) / batch_f
+    sync_val = (tf.reduce_sum(tf.abs(corr_mat)) - tf.cast(HIDDEN, tf.float32)) / tf.cast(HIDDEN**2 - HIDDEN, tf.float32)
 
-    # 4. Auto-Correlation
-    acorr_val = np.mean(np.abs(np.corrcoef(h_seq_v.numpy()[0].T + 1e-8)))
+    # 3. Auto-Correlation
+    sample_seq = h_seq_v[0]
+    s_norm = (sample_seq - tf.reduce_mean(sample_seq, axis=0)) / (tf.math.reduce_std(sample_seq, axis=0) + 1e-8)
+    t_corr = tf.matmul(s_norm, s_norm, transpose_a=True) / tf.cast(tf.shape(s_norm)[0], tf.float32)
+    acorr_val = tf.reduce_mean(tf.abs(t_corr))
 
-    # 5. Interference
-    mean_field = np.mean(h_final, axis=1, keepdims=True)
-    neuron_to_field_corrs = [
-        np.abs(np.corrcoef(h_final[:, j], mean_field[:, 0])[0, 1]) 
-        for j in range(h_final.shape[1])
-    ]
-    interference_val = np.mean(np.nan_to_num(neuron_to_field_corrs))
-    
+    # 4. Interference
+    mean_field = tf.reduce_mean(h_norm, axis=1, keepdims=True)
+    neuron_field_cov = tf.matmul(h_norm, mean_field, transpose_a=True) / batch_f
+    interference_val = tf.reduce_mean(tf.abs(neuron_field_cov))
+
+    return eff_rank, sync_val, acorr_val, interference_val, h_final, logits_v
+
+def calculate_entropy_cpu(h_final_np):
+    counts, _ = np.histogram(h_final_np, bins=50)
+    p_ent = counts / (h_final_np.size + 1e-10)
+    return float(-np.sum(p_ent * np.log2(p_ent + 1e-10)))
+
+@tf.function
+def get_val_acc(y_val, logits_v):
     val_acc_metric.update_state(y_val, logits_v)
-    v_acc = val_acc_metric.result().numpy()
-    val_acc_metric.reset_state()
-    
-    return v_acc, eff_rank, sync_val, entropy_val, acorr_val, interference_val
+    return val_acc_metric.result()
 
 # --- 6. EXECUTION ---
 epoch_history = []
-
 for epoch in range(EPOCHS):
     train_loss_metric.reset_state()
     train_acc_metric.reset_state()
+    val_acc_metric.reset_state()
 
     for x_b, y_b in train_ds:
         train_step(x_b, y_b)
 
-    # Calculate metrics for the current epoch
-    v_acc, e_rank, s_val, entr, acorr, interf = calculate_complex_metrics(val_subset_x, val_subset_y)
-    
-    # Create the snapshot for THIS epoch
+    e_rank, s_val, acorr, interf, h_final, logits_v = calculate_metrics_gpu(val_subset_x, val_subset_y)
+    v_acc = float(get_val_acc(val_subset_y, logits_v).numpy())
+    entr = calculate_entropy_cpu(h_final.numpy())
+    e_rank, s_val, acorr, interf = [float(t.numpy()) for t in [e_rank, s_val, acorr, interf]]
+
+    final_loss = float(train_loss_metric.result().numpy())
+
     current_snapshot = {
         "epoch": epoch + 1,
-        "loss": float(train_loss_metric.result().numpy()),
-        "acc": float(v_acc),
-        "rank": float(e_rank),
-        "sync": float(s_val),
-        "entr": float(entr),
-        "acorr": float(acorr),
-        "intf": float(interf)
+        "loss": final_loss,
+        "acc": v_acc, "rank": e_rank, "sync": s_val,
+        "entr": entr, "acorr": acorr, "intf": interf
     }
     epoch_history.append(current_snapshot)
 
-    # Console Logging
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # 2. Print the "Full-Spectrum" log
     print(f"[{timestamp}] Epoch {epoch+1}/{EPOCHS} | Run: {RUN_ID}")
-    print(f"  > [STATS] Acc: {v_acc:.4f} | Rank: {e_rank:.2f} | Sync: {s_val:.4f}")
+    print(f"  > [STATS] Loss: {final_loss:.4f} | Acc: {v_acc:.4f} | Rank: {e_rank:.2f} | Sync: {s_val:.4f}")
     print(f"  > [EXTRA] Entr: {entr:.4f} | ACorr: {acorr:.4f} | Intf: {interf:.4f}")
     print(f"{'-'*70}")
 
-    # Break if unstable
-    if np.isnan(train_loss_metric.result().numpy()) or e_rank < 1.01:
+    if np.isnan(final_loss) or e_rank < 1.01:
         print(f"!!! CRITICAL INSTABILITY DETECTED !!!")
         break
 
 # --- 7. FINAL JSON DUMP ---
 # This builds the master object for this specific Sobol run
+final_loss = epoch_history[-1]["loss"]
+final_acc = epoch_history[-1]["acc"]
+status = "failed" if (np.isnan(final_loss) or np.isinf(final_loss) or final_acc < 0.11) else "complete"
+
 result_data = {
     "run_id": int(RUN_ID),
     "session": SESSION_ID,
+    "status": status,
+    "completed_epochs": len(epoch_history),
     "parameters": {
         "lambda": float(LAMBDA_SLOW),
         "inertia": float(H_INERTIA),
@@ -260,16 +266,16 @@ result_data = {
         "period": float(PERIOD),
         "jitter": float(JITTER_SCALE)
     },
-    # This key satisfies the Orchestrator's need for 'final' values
     "acc": epoch_history[-1]["acc"],
     "rank": epoch_history[-1]["rank"],
     "sync": epoch_history[-1]["sync"],
     "entr": epoch_history[-1]["entr"],
     "acorr": epoch_history[-1]["acorr"],
     "intf": epoch_history[-1]["intf"],
-    # This key contains the full time-series data for your thesis
-    "epochs": epoch_history 
+    "epochs": epoch_history
 }
+
+print(f"[STATUS] Run {RUN_ID}: {status} | Epochs: {len(epoch_history)} | Final Acc: {final_acc:.4f}")
 
 def numpy_fix(obj):
     if isinstance(obj, (np.ndarray, np.generic)):
