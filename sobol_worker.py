@@ -48,10 +48,10 @@ except IndexError:
     sys.exit(1)
 
 # Derived Constants
-HIDDEN = 32
+HIDDEN = 16
 EPOCHS = 10
 BATCH_SIZE = 512
-DATA_PERCENT = 0.1
+DATA_PERCENT = 0.05
 LEARNING_RATE = 5e-3
 REST_BASELINE = 1.0
 H_SCALE = [H_INERTIA, 1.0 - H_INERTIA]
@@ -191,10 +191,17 @@ def calculate_metrics_gpu(x_val, y_val):
     sync_val = (tf.reduce_sum(tf.abs(corr_mat)) - tf.cast(HIDDEN, tf.float32)) / tf.cast(HIDDEN**2 - HIDDEN, tf.float32)
 
     # 3. Auto-Correlation
-    sample_seq = h_seq_v[0]
-    s_norm = (sample_seq - tf.reduce_mean(sample_seq, axis=0)) / (tf.math.reduce_std(sample_seq, axis=0) + 1e-8)
-    t_corr = tf.matmul(s_norm, s_norm, transpose_a=True) / tf.cast(tf.shape(s_norm)[0], tf.float32)
-    acorr_val = tf.reduce_mean(tf.abs(t_corr))
+    sample_seq    = h_seq_v[0]
+    x_t           = sample_seq[1:, :]
+    x_t_prev      = sample_seq[:-1, :]
+
+    def z_score(x):
+        return (x - tf.reduce_mean(x, axis=0)) / (tf.math.reduce_std(x, axis=0) + 1e-8)
+
+    x_t_norm      = z_score(x_t)
+    x_t_prev_norm = z_score(x_t_prev)
+    neuron_persist = tf.reduce_mean(x_t_norm * x_t_prev_norm, axis=0)
+    acorr_val      = tf.reduce_mean(neuron_persist)
 
     # 4. Interference
     mean_field = tf.reduce_mean(h_norm, axis=1, keepdims=True)

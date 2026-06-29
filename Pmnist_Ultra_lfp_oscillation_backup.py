@@ -1,4 +1,4 @@
-we are doing pmnist atm the here is part of the script:"import tensorflow as tf
+import tensorflow as tf
 import numpy as np
 from tqdm import tqdm
 import time

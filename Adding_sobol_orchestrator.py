@@ -37,7 +37,7 @@ Y_mse = np.zeros(len(param_values))
 full_history_archive = []
 
 # --- 2. EXECUTION LOOP ---
-# We now iterate one by one to ensure a clean RAM/VRAM state every time
+#  Clean RAM/VRAM state every time
 for run_id in range(len(param_values)):
     print(f"\n>>> Starting Run {run_id + 1} of {len(param_values)}")
     
@@ -70,7 +70,7 @@ for run_id in range(len(param_values)):
         Y_mse[run_id] = 999.0
 
     # --- 4. SAVE MASTER PROGRESS (ATOMIC) ---
-    # Save after every run so you don't lose data if the power goes out
+    # Save after every run 
     with open(PATH_Y + ".tmp", "w") as f:
         json.dump(Y_mse[:run_id+1].tolist(), f, indent=4)
     os.replace(PATH_Y + ".tmp", PATH_Y)
